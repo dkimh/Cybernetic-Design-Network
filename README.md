@@ -65,3 +65,4 @@ By visualizing design as a cybernetic network, this project reveals:
 - Every decision creates ripples throughout the system
 - Understanding feedback loops leads to better design outcomes
 - The design process is an ecosystem, not a checklist
+
