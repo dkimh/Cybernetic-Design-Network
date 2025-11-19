@@ -1,0 +1,82 @@
+{
+  "nodes": [
+    { "id": "form", "label": "Form" },
+    { "id": "function", "label": "Function" },
+    { "id": "material", "label": "Material" },
+    { "id": "process", "label": "Process" },
+    { "id": "emotion", "label": "Emotion & Aesthetics" },
+
+    { "id": "balance", "label": "Balance / Stability" },
+    { "id": "modularity", "label": "Modularity" },
+    { "id": "scale", "label": "Scale & Proportion" },
+    { "id": "geometry", "label": "Geometry" },
+    { "id": "visual", "label": "Visual Rhythm" },
+    { "id": "structure", "label": "Structure" },
+    { "id": "composition", "label": "Composition / Layout" },
+
+    { "id": "adaptability", "label": "Adaptability" },
+    { "id": "ergonomics", "label": "Ergonomics" },
+    { "id": "usability", "label": "Usability" },
+    { "id": "maintenance", "label": "Maintenance" },
+
+    { "id": "sustainability", "label": "Sustainability" },
+    { "id": "texture", "label": "Texture / Surface" },
+    { "id": "materialChoice", "label": "Material Choice" },
+    { "id": "aging", "label": "Aging / Durability" },
+    { "id": "thermal", "label": "Thermal Properties" },
+
+    { "id": "cultural", "label": "Cultural Reference" },
+    { "id": "emotionNode", "label": "Emotion" },
+    { "id": "storytelling", "label": "Storytelling (Concept)" },
+    { "id": "identity", "label": "Personal Identity (Designer Preference)" },
+
+    { "id": "cost", "label": "Cost & Time" },
+    { "id": "fabrication", "label": "Fabrication" },
+    { "id": "assembly", "label": "Assembly Complexity" },
+    { "id": "supplyChain", "label": "Supply Chain" }
+  ],
+
+  "links": [
+    { "source": "form", "target": "balance" },
+    { "source": "form", "target": "modularity" },
+    { "source": "form", "target": "scale" },
+    { "source": "form", "target": "geometry" },
+    { "source": "form", "target": "visual" },
+    { "source": "form", "target": "structure" },
+    { "source": "form", "target": "composition" },
+
+    { "source": "structure", "target": "form" },
+    { "source": "composition", "target": "form" },
+
+    { "source": "function", "target": "adaptability" },
+    { "source": "function", "target": "ergonomics" },
+    { "source": "function", "target": "usability" },
+    { "source": "function", "target": "maintenance" },
+    { "source": "function", "target": "form" },
+
+    { "source": "material", "target": "sustainability" },
+    { "source": "material", "target": "texture" },
+    { "source": "material", "target": "materialChoice" },
+    { "source": "material", "target": "aging" },
+    { "source": "material", "target": "thermal" },
+    { "source": "material", "target": "form" },
+    { "source": "material", "target": "process" },
+
+    { "source": "emotion", "target": "cultural" },
+    { "source": "emotion", "target": "emotionNode" },
+    { "source": "emotion", "target": "storytelling" },
+    { "source": "emotion", "target": "identity" },
+    { "source": "emotion", "target": "form" },
+    { "source": "emotion", "target": "function" },
+
+    { "source": "process", "target": "cost" },
+    { "source": "process", "target": "fabrication" },
+    { "source": "process", "target": "assembly" },
+    { "source": "process", "target": "supplyChain" },
+
+    { "source": "cost", "target": "form" },
+    { "source": "fabrication", "target": "material" },
+    { "source": "assembly", "target": "structure" },
+    { "source": "supplyChain", "target": "material" }
+  ]
+}
