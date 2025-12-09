@@ -1,1142 +1,1297 @@
-import React, { useEffect, useRef, useState } from 'react';
-import * as d3 from 'd3';
+import React, { useMemo, useState, useCallback, useRef } from 'react';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
+import { OrbitControls, Html, Line } from '@react-three/drei';
+import * as THREE from 'three';
 import data from '../public/data.json';
 
-interface Node extends d3.SimulationNodeDatum {
+interface RawNode {
     id: string;
     label: string;
-    color?: string;
-    size?: number;
-    level?: number;
 }
 
-interface Link extends d3.SimulationLinkDatum<Node> {
-    source: string | Node;
-    target: string | Node;
+interface RawLink {
+    source: string;
+    target: string;
 }
 
-interface NodeInfo {
-    name: string;
-    connections: number;
-    incoming: number;
-    outgoing: number;
+interface NodeLayer {
+    level: number;
+    nodes: string[];
 }
 
-const CyberneticDesignNetwork: React.FC = () => {
-    const svgRef = useRef<SVGSVGElement>(null);
-    const [nodeInfo, setNodeInfo] = useState<NodeInfo | null>(null);
-    const [animationRunning, setAnimationRunning] = useState(true);
-    const [isRandomized, setIsRandomized] = useState(false);
-    const [zoomLevel, setZoomLevel] = useState(1);
-    const [nodePath, setNodePath] = useState<string[]>([]);
-    const [nodeWeights, setNodeWeights] = useState<Map<string, number>>(new Map());
-    const [decisionHistory, setDecisionHistory] = useState<Array<{nodeId: string, impact: 'positive' | 'negative' | 'neutral'}>>([]);
-    const [adaptiveMode, setAdaptiveMode] = useState(false);
-    const [currentStep, setCurrentStep] = useState(0);
-    const simulationRef = useRef<d3.Simulation<Node, Link> | null>(null);
-    const activeNodeRef = useRef<string | null>(null);
-    const originalLinksRef = useRef<Link[]>([]);
-    const zoomBehaviorRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null);
-    const gRef = useRef<SVGGElement | null>(null);
+interface NodeExploration {
+    visits: number;
+    insightful: number;
+    neutral: number;
+    familiar: number;
+}
+
+// ==== Utility: Calculate exploration score for a node ====
+function getExplorationScore(nodeId: string, explorationData: Map<string, NodeExploration>): number {
+    const data = explorationData.get(nodeId);
+    if (!data) return 0;
     
-    // Define color scheme based on node hierarchy
-    const getNodeColor = (nodeId: string): string => {
-        // Main categories (level 1)
-        const mainCategories: Record<string, string> = {
+    const totalFeedback = data.insightful + data.neutral + data.familiar;
+    if (totalFeedback === 0) {
+        return 0; // Neutral score for unexplored nodes
+    }
+    
+    // Score: insightful increases score, familiar decreases score
+    // Range: -2 to +2
+    const score = (data.insightful * 2 - data.familiar * 2) / totalFeedback;
+    return score;
+}
+
+// ==== Adaptive BFS with layer reordering based on exploration ====
+function getAdaptiveHierarchicalLayers(
+    startId: string,
+    links: RawLink[],
+    explorationData: Map<string, NodeExploration>,
+    cyberneticMode: boolean
+): NodeLayer[] {
+    const visited = new Set<string>();
+    const layers: NodeLayer[] = [];
+    let currentLevel = [startId];
+    let level = 0;
+    
+    // First, do normal BFS to get all reachable nodes
+    const allNodesInPath: string[] = [];
+    const tempVisited = new Set<string>();
+    let tempLevel = [startId];
+    
+    while (tempLevel.length > 0) {
+        const validNodes = tempLevel.filter(id => !tempVisited.has(id));
+        if (validNodes.length === 0) break;
+        
+        validNodes.forEach(id => {
+            tempVisited.add(id);
+            allNodesInPath.push(id);
+        });
+        
+        const nextLevel: string[] = [];
+        validNodes.forEach(nodeId => {
+            const outgoing = links
+                .filter(l => l.source === nodeId)
+                .map(l => l.target);
+            nextLevel.push(...outgoing);
+        });
+        
+        tempLevel = nextLevel;
+    }
+    
+    // In cybernetic mode, reorder nodes by exploration score
+    if (cyberneticMode && allNodesInPath.length > 1) {
+        // Keep the start node at layer 0
+        const startNode = allNodesInPath[0];
+        const otherNodes = allNodesInPath.slice(1);
+        
+        // Sort other nodes by exploration score (higher score = earlier layer)
+        const nodesWithScores = otherNodes.map(nodeId => ({
+            id: nodeId,
+            score: getExplorationScore(nodeId, explorationData)
+        }));
+        
+        nodesWithScores.sort((a, b) => b.score - a.score);
+        
+        // Distribute into layers
+        layers.push({ level: 0, nodes: [startNode] });
+        
+        const nodesPerLayer = 3;
+        let currentLayerNodes: string[] = [];
+        let currentLayerIndex = 1;
+        
+        nodesWithScores.forEach((node, idx) => {
+            currentLayerNodes.push(node.id);
+            
+            if (currentLayerNodes.length >= nodesPerLayer || idx === nodesWithScores.length - 1) {
+                layers.push({ level: currentLayerIndex, nodes: [...currentLayerNodes] });
+                currentLayerNodes = [];
+                currentLayerIndex++;
+            }
+        });
+        
+        return layers;
+    }
+    
+    // Normal mode: standard BFS
+    while (currentLevel.length > 0) {
+        const validNodes = currentLevel.filter(id => !visited.has(id));
+        if (validNodes.length === 0) break;
+        
+        validNodes.forEach(id => visited.add(id));
+        layers.push({ level, nodes: validNodes });
+        
+        const nextLevel: string[] = [];
+        validNodes.forEach(nodeId => {
+            const outgoing = links
+                .filter(l => l.source === nodeId)
+                .map(l => l.target);
+            nextLevel.push(...outgoing);
+        });
+        
+        currentLevel = nextLevel;
+        level++;
+    }
+    
+    return layers;
+}
+
+// ==== Force-directed layout with randomization ====
+function forceDirectedLayout(nodes: RawNode[], links: RawLink[], randomize: boolean = false) {
+    const positions = new Map<string, { x: number; y: number; vx: number; vy: number }>();
+    
+    // Initialize positions
+    nodes.forEach((node, i) => {
+        if (randomize) {
+            // Random initialization with larger spread
+            const angle = Math.random() * Math.PI * 2;
+            const radius = 2 + Math.random() * 3;
+            positions.set(node.id, {
+                x: Math.cos(angle) * radius,
+                y: Math.sin(angle) * radius,
+                vx: (Math.random() - 0.5) * 0.1,
+                vy: (Math.random() - 0.5) * 0.1
+            });
+        } else {
+            const angle = (i / nodes.length) * Math.PI * 2;
+            const radius = 3.5;
+            positions.set(node.id, {
+                x: Math.cos(angle) * radius,
+                y: Math.sin(angle) * radius,
+                vx: 0,
+                vy: 0
+            });
+        }
+    });
+    
+    // Force simulation
+    const iterations = randomize ? 200 : 100;
+    const repulsionStrength = 0.5;
+    const attractionStrength = 0.02;
+    const damping = 0.85;
+    
+    for (let iter = 0; iter < iterations; iter++) {
+        // Apply repulsion between all nodes
+        nodes.forEach((nodeA) => {
+            nodes.forEach((nodeB) => {
+                if (nodeA.id === nodeB.id) return;
+                
+                const posA = positions.get(nodeA.id)!;
+                const posB = positions.get(nodeB.id)!;
+                
+                const dx = posA.x - posB.x;
+                const dy = posA.y - posB.y;
+                const distSq = dx * dx + dy * dy + 0.01;
+                const dist = Math.sqrt(distSq);
+                
+                const force = repulsionStrength / distSq;
+                
+                posA.vx += (dx / dist) * force;
+                posA.vy += (dy / dist) * force;
+            });
+        });
+        
+        // Apply attraction along links
+        links.forEach(link => {
+            const posA = positions.get(link.source);
+            const posB = positions.get(link.target);
+            if (!posA || !posB) return;
+            
+            const dx = posB.x - posA.x;
+            const dy = posB.y - posA.y;
+            const dist = Math.sqrt(dx * dx + dy * dy + 0.01);
+            
+            const force = dist * attractionStrength;
+            
+            posA.vx += (dx / dist) * force;
+            posA.vy += (dy / dist) * force;
+            posB.vx -= (dx / dist) * force;
+            posB.vy -= (dy / dist) * force;
+        });
+        
+        // Update positions with velocity damping
+        nodes.forEach(node => {
+            const pos = positions.get(node.id)!;
+            pos.x += pos.vx;
+            pos.y += pos.vy;
+            pos.vx *= damping;
+            pos.vy *= damping;
+            
+            // Add slight random jitter in early iterations for randomize mode
+            if (randomize && iter < iterations / 3) {
+                pos.x += (Math.random() - 0.5) * 0.05;
+                pos.y += (Math.random() - 0.5) * 0.05;
+            }
+        });
+    }
+    
+    // Normalize to fit within viewport
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    
+    positions.forEach(pos => {
+        minX = Math.min(minX, pos.x);
+        maxX = Math.max(maxX, pos.x);
+        minY = Math.min(minY, pos.y);
+        maxY = Math.max(maxY, pos.y);
+    });
+    
+    const rangeX = maxX - minX;
+    const rangeY = maxY - minY;
+    const maxRange = Math.max(rangeX, rangeY) || 1;
+    const targetSize = 8;
+    const scale = targetSize / maxRange;
+    
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    
+    positions.forEach(pos => {
+        pos.x = (pos.x - centerX) * scale;
+        pos.y = (pos.y - centerY) * scale;
+    });
+    
+    return positions;
+}
+
+// ==== Camera Controller for smooth transitions ====
+interface CameraControllerProps {
+    targetPosition: THREE.Vector3;
+    targetLookAt: THREE.Vector3;
+    is2DMode: boolean;
+}
+
+const CameraController: React.FC<CameraControllerProps> = ({
+                                                               targetPosition,
+                                                               targetLookAt,
+                                                               is2DMode
+                                                           }) => {
+    const { camera } = useThree();
+    const controlsRef = useRef<any>(null);
+    
+    useFrame(() => {
+        if (!controlsRef.current) return;
+        
+        camera.position.lerp(targetPosition, 0.05);
+        
+        const currentTarget = controlsRef.current.target;
+        currentTarget.lerp(targetLookAt, 0.05);
+        controlsRef.current.update();
+    });
+    
+    return (
+        <OrbitControls
+            ref={controlsRef}
+            enablePan={true}
+            enableZoom={true}
+            enableRotate={!is2DMode}
+            maxDistance={35}
+            minDistance={2}
+        />
+    );
+};
+
+// ==== Node marker ====
+interface NodeMarkerProps {
+    id: string;
+    label: string;
+    position: THREE.Vector3;
+    color: string;
+    onClick: (id: string) => void;
+    isActive: boolean;
+    is2DMode: boolean;
+    exploration: NodeExploration;
+    cyberneticMode: boolean;
+    layerChanged?: boolean;
+}
+
+const NodeMarker: React.FC<NodeMarkerProps> = ({
+                                                   id,
+                                                   label,
+                                                   position,
+                                                   color,
+                                                   onClick,
+                                                   isActive,
+                                                   is2DMode,
+                                                   exploration,
+                                                   cyberneticMode,
+                                                   layerChanged
+                                               }) => {
+    // Calculate feedback-based adjustments
+    const getFeedbackAdjustment = () => {
+        if (!cyberneticMode) {
+            return { opacity: 1, intensity: 1 };
+        }
+        
+        const totalFeedback = exploration.insightful + exploration.neutral + exploration.familiar;
+        
+        if (totalFeedback === 0) {
+            return { opacity: 1, intensity: 1 };
+        }
+        
+        // Calculate weighted score
+        const score = (exploration.insightful * 1 - exploration.familiar * 1) / totalFeedback;
+        
+        // Opacity: reduce for familiar nodes (0.3 to 1.0)
+        const opacity = Math.max(0.3, 1 - (exploration.familiar / (totalFeedback + 1)) * 0.7);
+        
+        // Intensity: increase for insightful nodes (0.8 to 1.8)
+        const intensity = 1 + (score * 0.5);
+        
+        return { opacity, intensity };
+    };
+    
+    const { opacity: nodeOpacity, intensity: intensityMultiplier } = getFeedbackAdjustment();
+    
+    const baseIntensity = isActive ? 1.5 : 0.8;
+    const emissiveIntensity = baseIntensity * intensityMultiplier;
+    
+    const baseOpacity = isActive ? 0.3 : 0.15;
+    const adjustedOpacity = baseOpacity * nodeOpacity;
+    
+    return (
+        <group
+            position={position}
+            onClick={e => {
+                e.stopPropagation();
+                onClick(id);
+            }}
+        >
+            {/* Layer changed indicator */}
+            {layerChanged && (
+                <mesh position={[0, 0.8, 0]}>
+                    <ringGeometry args={[0.15, 0.2, 16]} />
+                    <meshBasicMaterial
+                        color="#ffaa00"
+                        transparent
+                        opacity={0.8}
+                        side={THREE.DoubleSide}
+                    />
+                </mesh>
+            )}
+            
+            {/* Outer glow halo */}
+            <mesh>
+                <sphereGeometry args={[0.35, 32, 32]} />
+                <meshBasicMaterial
+                    color={color}
+                    transparent
+                    opacity={adjustedOpacity}
+                    depthWrite={false}
+                />
+            </mesh>
+            
+            {/* Middle glow ring */}
+            <mesh>
+                <sphereGeometry args={[0.22, 32, 32]} />
+                <meshBasicMaterial
+                    color={color}
+                    transparent
+                    opacity={(isActive ? 0.5 : 0.3) * nodeOpacity}
+                    depthWrite={false}
+                />
+            </mesh>
+            
+            {/* Core sphere */}
+            <mesh castShadow>
+                <sphereGeometry args={[0.14, 32, 32]} />
+                <meshStandardMaterial
+                    color={color}
+                    emissive={color}
+                    emissiveIntensity={emissiveIntensity}
+                    roughness={0.2}
+                    metalness={0.8}
+                    transparent={cyberneticMode}
+                    opacity={nodeOpacity}
+                />
+            </mesh>
+            
+            {/* Point light for bloom effect */}
+            <pointLight
+                color={color}
+                intensity={emissiveIntensity}
+                distance={2}
+                decay={2}
+            />
+            
+            {/* Label */}
+            <Html position={[0, 0.6, 0]} distanceFactor={is2DMode ? 12 : 8}>
+                <div
+                    style={{
+                        padding: '3px 7px',
+                        borderRadius: '999px',
+                        fontSize: 10,
+                        background: isActive
+                            ? 'rgba(0,212,255,0.25)'
+                            : 'rgba(10,10,15,0.8)',
+                        border: isActive
+                            ? '1px solid rgba(0,212,255,0.6)'
+                            : layerChanged
+                                ? '1px solid #ffaa00'
+                                : '1px solid rgba(255,255,255,0.1)',
+                        color: '#ffffff',
+                        whiteSpace: 'nowrap',
+                        boxShadow: isActive
+                            ? '0 0 12px rgba(0,212,255,0.9)'
+                            : layerChanged
+                                ? '0 0 8px #ffaa00'
+                                : '0 0 4px rgba(0,0,0,0.6)',
+                        opacity: nodeOpacity,
+                    }}
+                >
+                    {label}
+                    {layerChanged && <span style={{ marginLeft: 4 }}>↕️</span>}
+                </div>
+            </Html>
+        </group>
+    );
+};
+
+// ==== Main 3D Scene ====
+interface SceneProps {
+    activeNode: string | null;
+    hierarchicalLayers: NodeLayer[];
+    onNodeClick: (id: string) => void;
+    cyberneticMode: boolean;
+    layout2D: Map<string, { x: number; y: number; vx: number; vy: number }>;
+    explorationData: Map<string, NodeExploration>;
+    previousLayers: NodeLayer[];
+}
+
+const CyberneticTopoScene: React.FC<SceneProps> = ({
+                                                       activeNode,
+                                                       hierarchicalLayers,
+                                                       onNodeClick,
+                                                       cyberneticMode,
+                                                       layout2D,
+                                                       explorationData,
+                                                       previousLayers
+                                                   }) => {
+    const nodes = data.nodes as RawNode[];
+    const links = data.links as RawLink[];
+    
+    const getNodeColor = useCallback((id: string): string => {
+        const main: Record<string, string> = {
             form: '#4ECDC4',
             function: '#95E1D3',
             material: '#FF6B6B',
             emotion: '#F38181',
             process: '#AA96DA',
-        };
-        
-        // Secondary nodes (level 2)
-        const secondaryColors: Record<string, string> = {
-            // Form related
-            balance: '#5FD9D1',
-            modularity: '#6FE4DC',
-            scale: '#7FEFE7',
-            geometry: '#8FF5F2',
-            visual: '#9FFAFD',
-            structure: '#3FC1B9',
-            composition: '#AFFFFF', // Form-related (lightest teal)
-            
-            // Function related
-            adaptability: '#A5EBE3',
-            ergonomics: '#B5F6EE',
-            usability: '#85D6CE',
-            maintenance: '#75CBC3',
-            
-            // Material related
-            sustainability: '#FF8B8B',
-            texture: '#FFA5A5',
-            materialChoice: '#FF7171',
-            aging: '#FF5757',
-            thermal: '#FFBFBF', // Material-related (lighter red)
-            
-            // Emotion related
-            cultural: '#F59B9B',
-            emotionNode: '#FAB1B1',
-            storytelling: '#FF8181',
-            identity: '#FF6767',
-            
-            // Process related
-            cost: '#BAA6E0',
-            fabrication: '#CAB6F0',
-            assembly: '#AA96DA',
-            supplyChain: '#DAC6FA', // Process-related (lighter purple)
             feedbackLoop: '#FCBAD3',
         };
-        
-        return mainCategories[nodeId] || secondaryColors[nodeId] || '#A0A0A0';
-    };
+        return main[id] || '#a0a0a0';
+    }, []);
     
-    // Calculate node size based on connections
-    const getNodeSize = (nodeId: string, links: Link[]): number => {
-        const mainNodes = ['form', 'function', 'material', 'emotion', 'process'];
+    // Detect nodes that changed layers
+    const changedLayerNodes = useMemo(() => {
+        if (!cyberneticMode || previousLayers.length === 0) return new Map<string, { from: number; to: number }>();
         
-        if (mainNodes.includes(nodeId)) {
-            return 55; // All main nodes are large
-        }
-        
-        // Special node: feedbackLoop is also important
-        if (nodeId === 'feedbackLoop') {
-            return 50;
-        }
-        
-        const connectionCount = links.filter(
-            (l) =>
-                (typeof l.source === 'string' ? l.source : l.source.id) === nodeId ||
-                (typeof l.target === 'string' ? l.target : l.target.id) === nodeId
-        ).length;
-        
-        return Math.max(25, Math.min(45, 25 + connectionCount * 3));
-    };
-    
-    // Process data from JSON
-    const processedNodes: Node[] = data.nodes.map((node) => ({
-        ...node,
-        color: getNodeColor(node.id),
-        size: getNodeSize(node.id, data.links),
-    }));
-    
-    const processedLinks: Link[] = data.links.map((link) => ({
-        source: link.source,
-        target: link.target,
-    }));
-    
-    // Store original links on first render
-    if (originalLinksRef.current.length === 0) {
-        originalLinksRef.current = processedLinks.map(link => ({ ...link }));
-    }
-    
-    // Function to randomize connections
-    const randomizeConnections = () => {
-        const nodeIds = processedNodes.map(n => n.id);
-        const newLinks: Link[] = [];
-        const usedPairs = new Set<string>();
-        const outgoingCount = new Map<string, number>();
-        const incomingCount = new Map<string, number>();
-        
-        // Initialize counts
-        nodeIds.forEach(id => {
-            outgoingCount.set(id, 0);
-            incomingCount.set(id, 0);
+        const previousLayerMap = new Map<string, number>();
+        previousLayers.forEach(layer => {
+            layer.nodes.forEach(nodeId => {
+                previousLayerMap.set(nodeId, layer.level);
+            });
         });
         
-        const minConnectionsPerNode = 3;
-        
-        // First pass: Ensure each node has at least 3 outgoing connections
-        for (const sourceNode of nodeIds) {
-            while ((outgoingCount.get(sourceNode) || 0) < minConnectionsPerNode) {
-                const targetNode = nodeIds[Math.floor(Math.random() * nodeIds.length)];
-                const pairKey = `${sourceNode}-${targetNode}`;
-                
-                if (sourceNode !== targetNode && !usedPairs.has(pairKey)) {
-                    newLinks.push({ source: sourceNode, target: targetNode });
-                    usedPairs.add(pairKey);
-                    outgoingCount.set(sourceNode, (outgoingCount.get(sourceNode) || 0) + 1);
-                    incomingCount.set(targetNode, (incomingCount.get(targetNode) || 0) + 1);
-                }
-            }
-        }
-        
-        // Second pass: Ensure each node has at least 3 incoming connections
-        for (const targetNode of nodeIds) {
-            while ((incomingCount.get(targetNode) || 0) < minConnectionsPerNode) {
-                const sourceNode = nodeIds[Math.floor(Math.random() * nodeIds.length)];
-                const pairKey = `${sourceNode}-${targetNode}`;
-                
-                if (sourceNode !== targetNode && !usedPairs.has(pairKey)) {
-                    newLinks.push({ source: sourceNode, target: targetNode });
-                    usedPairs.add(pairKey);
-                    outgoingCount.set(sourceNode, (outgoingCount.get(sourceNode) || 0) + 1);
-                    incomingCount.set(targetNode, (incomingCount.get(targetNode) || 0) + 1);
-                }
-            }
-        }
-        
-        // Third pass: Add more random connections to reach original total if needed
-        const targetNumLinks = originalLinksRef.current.length;
-        let attempts = 0;
-        const maxAttempts = targetNumLinks * 10;
-        
-        while (newLinks.length < targetNumLinks && attempts < maxAttempts) {
-            attempts++;
-            const source = nodeIds[Math.floor(Math.random() * nodeIds.length)];
-            const target = nodeIds[Math.floor(Math.random() * nodeIds.length)];
-            
-            const pairKey = `${source}-${target}`;
-            if (source !== target && !usedPairs.has(pairKey)) {
-                newLinks.push({ source, target });
-                usedPairs.add(pairKey);
-                outgoingCount.set(source, (outgoingCount.get(source) || 0) + 1);
-                incomingCount.set(target, (incomingCount.get(target) || 0) + 1);
-            }
-        }
-        
-        return newLinks;
-    };
-    
-    // Function to find paths from a node (BFS to get all reachable nodes)
-    const findNodePaths = (nodeId: string, links: Link[]): string[] => {
-        const visited = new Set<string>();
-        const queue: string[] = [nodeId];
-        const path: string[] = [];
-        
-        while (queue.length > 0) {
-            const current = queue.shift()!;
-            
-            if (visited.has(current)) continue;
-            visited.add(current);
-            path.push(current);
-            
-            // Find all nodes connected from current
-            const connectedNodes = links
-                .filter(l => {
-                    const sourceId = typeof l.source === 'string' ? l.source : l.source.id;
-                    return sourceId === current;
-                })
-                .map(l => typeof l.target === 'string' ? l.target : l.target.id);
-            
-            queue.push(...connectedNodes);
-        }
-        
-        return path;
-    };
-    
-    // Cybernetic: Generate adaptive path based on node weights and feedback
-    const generateAdaptivePath = (startNodeId: string, links: Link[], maxDepth: number = 8): string[] => {
-        const path: string[] = [startNodeId];
-        const visited = new Set<string>([startNodeId]);
-        let currentNode = startNodeId;
-        
-        for (let i = 0; i < maxDepth; i++) {
-            // Find all possible next nodes
-            const possibleNextNodes = links
-                .filter(l => {
-                    const sourceId = typeof l.source === 'string' ? l.source : l.source.id;
-                    const targetId = typeof l.target === 'string' ? l.target : l.target.id;
-                    return sourceId === currentNode && !visited.has(targetId);
-                })
-                .map(l => typeof l.target === 'string' ? l.target : l.target.id);
-            
-            if (possibleNextNodes.length === 0) break;
-            
-            // Select next node based on weights (higher weight = higher priority)
-            let nextNode: string;
-            if (adaptiveMode && nodeWeights.size > 0) {
-                // Weighted selection based on cybernetic feedback
-                const weightedNodes = possibleNextNodes.map(nodeId => ({
-                    nodeId,
-                    weight: nodeWeights.get(nodeId) || 1.0
-                }));
-                
-                // Sort by weight and add randomness
-                weightedNodes.sort((a, b) => b.weight - a.weight);
-                
-                // Select from top 3 with weighted randomness
-                const topCandidates = weightedNodes.slice(0, Math.min(3, weightedNodes.length));
-                const totalWeight = topCandidates.reduce((sum, n) => sum + n.weight, 0);
-                let random = Math.random() * totalWeight;
-                
-                nextNode = topCandidates[0].nodeId;
-                for (const candidate of topCandidates) {
-                    random -= candidate.weight;
-                    if (random <= 0) {
-                        nextNode = candidate.nodeId;
-                        break;
-                    }
-                }
-            } else {
-                // Random selection
-                nextNode = possibleNextNodes[Math.floor(Math.random() * possibleNextNodes.length)];
-            }
-            
-            path.push(nextNode);
-            visited.add(nextNode);
-            currentNode = nextNode;
-        }
-        
-        return path;
-    };
-    
-    // Cybernetic: Update node weights based on user feedback
-    const provideFeedback = (nodeId: string, impact: 'positive' | 'negative' | 'neutral') => {
-        const newWeights = new Map(nodeWeights);
-        const currentWeight = newWeights.get(nodeId) || 1.0;
-        
-        // Adjust weight based on feedback
-        let newWeight = currentWeight;
-        if (impact === 'positive') {
-            newWeight = Math.min(currentWeight * 1.5, 3.0); // Increase importance
-        } else if (impact === 'negative') {
-            newWeight = Math.max(currentWeight * 0.5, 0.3); // Decrease importance
-        }
-        
-        newWeights.set(nodeId, newWeight);
-        
-        // Propagate feedback to connected nodes (cybernetic ripple effect)
-        const connectedLinks = currentLinks.filter(l => {
-            const sourceId = typeof l.source === 'string' ? l.source : l.source.id;
-            const targetId = typeof l.target === 'string' ? l.target : l.target.id;
-            return sourceId === nodeId || targetId === nodeId;
+        const currentLayerMap = new Map<string, number>();
+        hierarchicalLayers.forEach(layer => {
+            layer.nodes.forEach(nodeId => {
+                currentLayerMap.set(nodeId, layer.level);
+            });
         });
         
-        connectedLinks.forEach(link => {
-            const targetId = typeof link.target === 'string' ? link.target : link.target.id;
-            const sourceId = typeof link.source === 'string' ? link.source : link.source.id;
-            const connectedNodeId = sourceId === nodeId ? targetId : sourceId;
-            
-            const connectedWeight = newWeights.get(connectedNodeId) || 1.0;
-            const adjustmentFactor = impact === 'positive' ? 1.2 : impact === 'negative' ? 0.8 : 1.0;
-            newWeights.set(connectedNodeId, Math.max(0.3, Math.min(connectedWeight * adjustmentFactor, 3.0)));
-        });
-        
-        setNodeWeights(newWeights);
-        setDecisionHistory([...decisionHistory, { nodeId, impact }]);
-        
-        // Regenerate path if in adaptive mode
-        if (adaptiveMode && activeNodeRef.current) {
-            const newPath = generateAdaptivePath(activeNodeRef.current, currentLinks);
-            setNodePath(newPath);
-        }
-    };
-    
-    const [currentLinks, setCurrentLinks] = useState<Link[]>(processedLinks);
-    
-    useEffect(() => {
-        if (!svgRef.current) return;
-        
-        const svg = d3.select(svgRef.current);
-        const width = svgRef.current.clientWidth;
-        const height = svgRef.current.clientHeight;
-        
-        // Clear previous content
-        svg.selectAll('*').remove();
-        
-        // Create main group for zoom/pan
-        const g = svg.append('g');
-        gRef.current = g.node();
-        
-        // Setup zoom behavior
-        const zoom = d3.zoom<SVGSVGElement, unknown>()
-            .scaleExtent([0.1, 4])
-            .on('zoom', (event) => {
-                g.attr('transform', event.transform);
-                setZoomLevel(event.transform.k);
-            });
-        
-        svg.call(zoom);
-        zoomBehaviorRef.current = zoom;
-        
-        // Define arrow markers
-        const defs = svg.append('defs');
-        
-        defs
-            .selectAll('marker')
-            .data(['arrow', 'arrow-active'])
-            .enter()
-            .append('marker')
-            .attr('id', (d) => d)
-            .attr('viewBox', '0 -5 10 10')
-            .attr('refX', 20)
-            .attr('refY', 0)
-            .attr('markerWidth', 6)
-            .attr('markerHeight', 6)
-            .attr('orient', 'auto')
-            .append('path')
-            .attr('d', 'M0,-5L10,0L0,5')
-            .attr('class', (d) => (d === 'arrow-active' ? 'arrow active' : 'arrow'));
-        
-        // Create force simulation
-        const simulation = d3
-            .forceSimulation<Node>(processedNodes)
-            .force(
-                'link',
-                d3
-                    .forceLink<Node, Link>(currentLinks)
-                    .id((d) => d.id)
-                    .distance(180)
-            )
-            .force('charge', d3.forceManyBody<Node>().strength(-1200))
-            .force('center', d3.forceCenter(width / 2, height / 2))
-            .force(
-                'collision',
-                d3.forceCollide<Node>().radius((d) => (d.size || 30) + 25)
-            );
-        
-        simulationRef.current = simulation;
-        
-        // Create links
-        const linkGroup = g.append('g');
-        const link = linkGroup
-            .selectAll('path')
-            .data(currentLinks)
-            .enter()
-            .append('path')
-            .attr('class', 'link')
-            .attr('stroke', 'rgba(255, 255, 255, 0.15)')
-            .attr('stroke-width', 1.5)
-            .attr('fill', 'none')
-            .attr('marker-end', 'url(#arrow)');
-        
-        // Create node groups
-        const nodeGroup = g.append('g');
-        const node = nodeGroup
-            .selectAll('g')
-            .data(processedNodes)
-            .enter()
-            .append('g')
-            .attr('class', 'node')
-            .style('cursor', 'pointer')
-            .call(
-                d3
-                    .drag<SVGGElement, Node>()
-                    .on('start', (event, d) => {
-                        if (!event.active) simulation.alphaTarget(0.3).restart();
-                        d.fx = d.x;
-                        d.fy = d.y;
-                    })
-                    .on('drag', (event, d) => {
-                        d.fx = event.x;
-                        d.fy = event.y;
-                    })
-                    .on('end', (event, d) => {
-                        if (!event.active) simulation.alphaTarget(0);
-                        d.fx = null;
-                        d.fy = null;
-                    })
-            )
-            .on('click', (event, d) => {
-                event.stopPropagation();
-                handleNodeClick(d);
-            });
-        
-        // Add circles to nodes
-        node
-            .append('circle')
-            .attr('r', (d) => {
-                const baseSize = d.size || 30;
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return baseSize * (0.8 + weight * 0.2); // Scale size based on weight
-            })
-            .attr('fill', (d) => d.color || '#A0A0A0')
-            .attr('stroke', (d) => {
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return weight > 1.5 ? '#a78bfa' : '#ffffff'; // Purple glow for high-weight nodes
-            })
-            .attr('stroke-width', (d) => {
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return weight > 1.5 ? 3 : 2;
-            })
-            .style('opacity', (d) => {
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return Math.max(0.5, Math.min(1.0, weight)); // Adjust opacity based on weight
-            });
-        
-        // Add labels to nodes
-        node
-            .append('text')
-            .attr('class', 'node-label')
-            .attr('dy', (d) => (d.size || 30) + 18)
-            .attr('text-anchor', 'middle')
-            .attr('fill', '#ffffff')
-            .attr('font-size', '11px')
-            .attr('font-weight', '600')
-            .style('pointer-events', 'none')
-            .style('text-shadow', '0 0 4px rgba(0, 0, 0, 0.8)')
-            .text((d) => d.label);
-        
-        // Handle node click
-        const handleNodeClick = (d: Node) => {
-            // Reset previous selection
-            node.classed('active', false);
-            node.selectAll('circle').style('filter', 'none');
-            link
-                .classed('active', false)
-                .attr('stroke', 'rgba(255, 255, 255, 0.15)')
-                .attr('stroke-width', 1.5)
-                .attr('marker-end', 'url(#arrow)');
-            
-            if (activeNodeRef.current === d.id) {
-                activeNodeRef.current = null;
-                setNodeInfo(null);
-                setNodePath([]);
-                return;
+        const changed = new Map<string, { from: number; to: number }>();
+        currentLayerMap.forEach((currentLevel, nodeId) => {
+            const previousLevel = previousLayerMap.get(nodeId);
+            if (previousLevel !== undefined && previousLevel !== currentLevel) {
+                changed.set(nodeId, { from: previousLevel, to: currentLevel });
             }
-            
-            activeNodeRef.current = d.id;
-            
-            // Find all nodes in the path from this node
-            const pathNodes = adaptiveMode
-                ? generateAdaptivePath(d.id, currentLinks)
-                : findNodePaths(d.id, currentLinks);
-            setNodePath(pathNodes);
-            setCurrentStep(0);
-            
-            // Highlight selected node
-            node
-                .filter((n) => n.id === d.id)
-                .classed('active', true)
-                .selectAll('circle')
-                .style('filter', 'brightness(1.5) drop-shadow(0 0 20px currentColor)');
-            
-            // Highlight connected links
-            link
-                .filter(
-                    (l) =>
-                        (l.source as Node).id === d.id || (l.target as Node).id === d.id
-                )
-                .classed('active', true)
-                .attr('stroke', 'rgba(0, 212, 255, 0.6)')
-                .attr('stroke-width', 2.5)
-                .attr('marker-end', 'url(#arrow-active)');
-            
-            // Calculate connection info
-            const outgoingLinks = currentLinks.filter(
-                (l) =>
-                    (typeof l.source === 'string' ? l.source : l.source.id) === d.id
-            );
-            const incomingLinks = currentLinks.filter(
-                (l) =>
-                    (typeof l.target === 'string' ? l.target : l.target.id) === d.id
-            );
-            
-            setNodeInfo({
-                name: d.label,
-                connections: outgoingLinks.length + incomingLinks.length,
-                outgoing: outgoingLinks.length,
-                incoming: incomingLinks.length,
-            });
-            
-            // Animate feedback propagation
-            propagateFeedback(d.id, node);
-        };
-        
-        // Animate feedback propagation
-        const propagateFeedback = (
-            sourceId: string,
-            nodeSelection: d3.Selection<SVGGElement, Node, SVGGElement, unknown>,
-            depth = 0,
-            visited = new Set<string>()
-        ) => {
-            if (depth > 3 || visited.has(sourceId)) return;
-            visited.add(sourceId);
-            
-            const connectedLinks = currentLinks.filter(
-                (l) => (typeof l.source === 'string' ? l.source : l.source.id) === sourceId
-            );
-            
-            connectedLinks.forEach((l, i) => {
-                setTimeout(() => {
-                    const targetId = typeof l.target === 'string' ? l.target : l.target.id;
-                    const targetNode = nodeSelection.filter((n) => n.id === targetId);
-                    
-                    targetNode
-                        .select('circle')
-                        .transition()
-                        .duration(300)
-                        .attr('r', (d) => (d.size || 30) * 1.3)
-                        .transition()
-                        .duration(300)
-                        .attr('r', (d) => d.size || 30);
-                    
-                    setTimeout(() => {
-                        propagateFeedback(targetId, nodeSelection, depth + 1, visited);
-                    }, 200);
-                }, i * 150);
-            });
-        };
-        
-        // Update positions on simulation tick
-        simulation.on('tick', () => {
-            link.attr('d', (d) => {
-                const source = d.source as Node;
-                const target = d.target as Node;
-                const dx = target.x! - source.x!;
-                const dy = target.y! - source.y!;
-                const dr = Math.sqrt(dx * dx + dy * dy);
-                return `M${source.x},${source.y}A${dr},${dr} 0 0,1 ${target.x},${target.y}`;
-            });
-            
-            node.attr('transform', (d) => `translate(${d.x},${d.y})`);
         });
         
-        // Click outside to deselect
-        svg.on('click', () => {
-            activeNodeRef.current = null;
-            node.classed('active', false);
-            node.selectAll('circle').style('filter', 'none');
-            link
-                .classed('active', false)
-                .attr('stroke', 'rgba(255, 255, 255, 0.15)')
-                .attr('stroke-width', 1.5)
-                .attr('marker-end', 'url(#arrow)');
-            setNodeInfo(null);
-            setNodePath([]);
+        return changed;
+    }, [hierarchicalLayers, previousLayers, cyberneticMode]);
+    
+    // 2D mode positions
+    const twoDPositions = useMemo(() => {
+        const map = new Map<string, THREE.Vector3>();
+        layout2D.forEach((pos, id) => {
+            map.set(id, new THREE.Vector3(pos.x, 0, pos.y));
+        });
+        return map;
+    }, [layout2D]);
+    
+    // Hierarchical mode: layered vertical arrangement
+    const hierarchicalPositions = useMemo(() => {
+        const map = new Map<string, THREE.Vector3>();
+        
+        if (!activeNode || hierarchicalLayers.length === 0) {
+            return map;
+        }
+        
+        hierarchicalLayers.forEach((layer, levelIdx) => {
+            const yPos = 4 - levelIdx * 1.8;
+            const numNodes = layer.nodes.length;
+            const radius = Math.min(3, numNodes * 0.4);
+            
+            layer.nodes.forEach((nodeId, nodeIdx) => {
+                const angle = (nodeIdx / numNodes) * Math.PI * 2;
+                const x = Math.cos(angle) * radius;
+                const z = Math.sin(angle) * radius;
+                
+                map.set(nodeId, new THREE.Vector3(x, yPos, z));
+            });
         });
         
-        // Cleanup
-        return () => {
-            simulation.stop();
-        };
-    }, [currentLinks]);
+        return map;
+    }, [activeNode, hierarchicalLayers]);
     
-    useEffect(() => {
-        if (simulationRef.current) {
-            if (animationRunning) {
-                simulationRef.current.alpha(0.3).restart();
-            } else {
-                simulationRef.current.stop();
-            }
-        }
-    }, [animationRunning]);
+    // Current positions
+    const nodePositions = useMemo(() => {
+        if (!activeNode) return twoDPositions;
+        return hierarchicalPositions;
+    }, [activeNode, twoDPositions, hierarchicalPositions]);
     
-    // Update node visuals when weights change (cybernetic feedback)
-    useEffect(() => {
-        if (!svgRef.current || nodeWeights.size === 0) return;
-        
-        const svg = d3.select(svgRef.current);
-        const allNodes = svg.selectAll<SVGGElement, Node>('.node');
-        
-        allNodes.selectAll('circle')
-            .transition()
-            .duration(500)
-            .attr('r', (d: Node) => {
-                const baseSize = d.size || 30;
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return baseSize * (0.8 + weight * 0.2);
-            })
-            .attr('stroke', (d: Node) => {
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return weight > 1.5 ? '#a78bfa' : '#ffffff';
-            })
-            .attr('stroke-width', (d: Node) => {
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return weight > 1.5 ? 3 : 2;
-            })
-            .style('opacity', (d: Node) => {
-                const weight = nodeWeights.get(d.id) || 1.0;
-                return Math.max(0.5, Math.min(1.0, weight));
-            });
-    }, [nodeWeights]);
-    
-    const resetSimulation = () => {
-        activeNodeRef.current = null;
-        setNodeInfo(null);
-        setNodePath([]);
-        setNodeWeights(new Map());
-        setDecisionHistory([]);
-        setCurrentStep(0);
-        if (simulationRef.current) {
-            simulationRef.current.alpha(1).restart();
-        }
-    };
-    
-    const randomPulse = () => {
-        const randomNode = processedNodes[Math.floor(Math.random() * processedNodes.length)];
-        activeNodeRef.current = randomNode.id;
-    };
-    
-    const toggleRandomize = () => {
-        if (isRandomized) {
-            // Restore original connections
-            setCurrentLinks(originalLinksRef.current.map(link => ({ ...link })));
-            setIsRandomized(false);
+    // Camera settings
+    const cameraSettings = useMemo(() => {
+        if (!activeNode) {
+            return {
+                position: new THREE.Vector3(0, 16, 0.1),
+                lookAt: new THREE.Vector3(0, 0, 0),
+                is2DMode: true
+            };
         } else {
-            // Generate random connections
-            const randomLinks = randomizeConnections();
-            setCurrentLinks(randomLinks);
-            setIsRandomized(true);
+            return {
+                position: new THREE.Vector3(8, 6, 8),
+                lookAt: new THREE.Vector3(0, 2, 0),
+                is2DMode: false
+            };
         }
+    }, [activeNode]);
+    
+    // Connection lines for hierarchical mode
+    const hierarchicalLines = useMemo(() => {
+        if (!activeNode || hierarchicalLayers.length === 0) return [];
         
-        // Clear any active node selection
-        activeNodeRef.current = null;
-        setNodeInfo(null);
-        setNodePath([]);
-    };
+        const lines: { from: THREE.Vector3; to: THREE.Vector3 }[] = [];
+        
+        hierarchicalLayers.forEach((layer, levelIdx) => {
+            if (levelIdx === hierarchicalLayers.length - 1) return;
+            
+            const nextLayer = hierarchicalLayers[levelIdx + 1];
+            
+            layer.nodes.forEach(sourceId => {
+                const sourcePos = hierarchicalPositions.get(sourceId);
+                if (!sourcePos) return;
+                
+                nextLayer.nodes.forEach(targetId => {
+                    const isConnected = links.some(
+                        l => l.source === sourceId && l.target === targetId
+                    );
+                    
+                    if (isConnected) {
+                        const targetPos = hierarchicalPositions.get(targetId);
+                        if (targetPos) {
+                            lines.push({ from: sourcePos.clone(), to: targetPos.clone() });
+                        }
+                    }
+                });
+            });
+        });
+        
+        return lines;
+    }, [activeNode, hierarchicalLayers, hierarchicalPositions, links]);
     
-    const handleZoomIn = () => {
-        if (svgRef.current && zoomBehaviorRef.current) {
-            d3.select(svgRef.current)
-                .transition()
-                .duration(300)
-                .call(zoomBehaviorRef.current.scaleBy, 1.3);
-        }
-    };
+    // Connection lines for 2D mode
+    const twoDLines = useMemo(() => {
+        if (activeNode) return [];
+        
+        return links.map(link => {
+            const from = twoDPositions.get(link.source);
+            const to = twoDPositions.get(link.target);
+            if (!from || !to) return null;
+            return { from, to };
+        }).filter(Boolean) as { from: THREE.Vector3; to: THREE.Vector3 }[];
+    }, [activeNode, links, twoDPositions]);
     
-    const handleZoomOut = () => {
-        if (svgRef.current && zoomBehaviorRef.current) {
-            d3.select(svgRef.current)
-                .transition()
-                .duration(300)
-                .call(zoomBehaviorRef.current.scaleBy, 0.7);
-        }
-    };
-    
-    const legendItems = [
-        { color: '#4ECDC4', label: 'Form' },
-        { color: '#95E1D3', label: 'Function' },
-        { color: '#FF6B6B', label: 'Material' },
-        { color: '#F38181', label: 'Emotion & Aesthetics' },
-        { color: '#AA96DA', label: 'Process' },
-        { color: '#FCBAD3', label: 'Feedback Loop' },
-    ];
+    const isNodeInPath = useCallback((nodeId: string) => {
+        return hierarchicalLayers.some(layer => layer.nodes.includes(nodeId));
+    }, [hierarchicalLayers]);
     
     return (
-        <div style={{ position: 'relative', width: '100vw', height: '100vh', background: '#0a0a0a' }}>
-            {/* Info Panel */}
-            <div
-                style={{
-                    position: 'absolute',
-                    top: '20px',
-                    left: '20px',
-                    background: 'rgba(20, 20, 20, 0.9)',
-                    padding: '20px',
-                    borderRadius: '12px',
-                    border: '1px solid rgba(255, 255, 255, 0.1)',
-                    maxWidth: '300px',
-                    backdropFilter: 'blur(10px)',
-                    color: '#fff',
-                    zIndex: 10,
-                }}
-            >
-                <h1 style={{ fontSize: '18px', marginBottom: '10px', color: '#ffffff' }}>
-                    Cybernetic Design Network
-                </h1>
-                <p style={{ fontSize: '12px', lineHeight: '1.6', color: '#999', marginBottom: '15px' }}>
-                    Click on nodes to see feedback loops. Each decision ripples through the system, creating
-                    a living, evolving design process.
-                </p>
-                {nodeInfo && (
-                    <div
-                        style={{
-                            marginTop: '15px',
-                            paddingTop: '15px',
-                            borderTop: '1px solid rgba(255, 255, 255, 0.1)',
-                        }}
-                    >
-                        <h2 style={{ fontSize: '14px', marginBottom: '8px', color: '#4ECDC4' }}>
-                            {nodeInfo.name}
-                        </h2>
-                        <div style={{ fontSize: '11px', color: '#666', marginBottom: '5px' }}>
-                            Total connections: {nodeInfo.connections}
-                        </div>
-                        <div style={{ fontSize: '11px', color: '#666', marginBottom: '5px' }}>
-                            Outgoing: {nodeInfo.outgoing} | Incoming: {nodeInfo.incoming}
-                        </div>
-                        {nodePath.length > 1 && (
-                            <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid rgba(255, 255, 255, 0.05)' }}>
-                                <div style={{ fontSize: '11px', color: '#4ECDC4', marginBottom: '5px', fontWeight: '600' }}>
-                                    {adaptiveMode ? 'Adaptive Path (Cybernetic):' : 'Connection Path:'}
-                                </div>
-                                <div style={{ fontSize: '10px', color: '#999', lineHeight: '1.5', marginBottom: '10px' }}>
-                                    {nodePath.map((nodeId, index) => {
-                                        const node = processedNodes.find(n => n.id === nodeId);
-                                        const isCurrentStep = index === currentStep;
-                                        return (
-                                            <span
-                                                key={nodeId}
-                                                style={{
-                                                    color: isCurrentStep ? '#00d4ff' : '#999',
-                                                    fontWeight: isCurrentStep ? '600' : 'normal'
-                                                }}
-                                            >
-                        {node?.label}
-                                                {index < nodePath.length - 1 && ' → '}
-                      </span>
-                                        );
-                                    })}
-                                </div>
-                                {adaptiveMode && currentStep < nodePath.length && (
-                                    <div>
-                                        <div style={{ fontSize: '10px', color: '#666', marginBottom: '6px' }}>
-                                            Provide feedback for: {processedNodes.find(n => n.id === nodePath[currentStep])?.label}
-                                        </div>
-                                        <div style={{ display: 'flex', gap: '4px', marginBottom: '8px' }}>
-                                            <button
-                                                onClick={() => {
-                                                    provideFeedback(nodePath[currentStep], 'positive');
-                                                    setCurrentStep(Math.min(currentStep + 1, nodePath.length - 1));
-                                                }}
-                                                style={{
-                                                    flex: 1,
-                                                    background: 'rgba(0, 255, 0, 0.15)',
-                                                    border: '1px solid rgba(0, 255, 0, 0.4)',
-                                                    color: '#00ff88',
-                                                    padding: '4px 8px',
-                                                    borderRadius: '4px',
-                                                    cursor: 'pointer',
-                                                    fontSize: '9px',
-                                                }}
-                                            >
-                                                ✓ Good
-                                            </button>
-                                            <button
-                                                onClick={() => {
-                                                    provideFeedback(nodePath[currentStep], 'neutral');
-                                                    setCurrentStep(Math.min(currentStep + 1, nodePath.length - 1));
-                                                }}
-                                                style={{
-                                                    flex: 1,
-                                                    background: 'rgba(255, 255, 0, 0.15)',
-                                                    border: '1px solid rgba(255, 255, 0, 0.4)',
-                                                    color: '#ffff00',
-                                                    padding: '4px 8px',
-                                                    borderRadius: '4px',
-                                                    cursor: 'pointer',
-                                                    fontSize: '9px',
-                                                }}
-                                            >
-                                                ~ OK
-                                            </button>
-                                            <button
-                                                onClick={() => {
-                                                    provideFeedback(nodePath[currentStep], 'negative');
-                                                    setCurrentStep(Math.min(currentStep + 1, nodePath.length - 1));
-                                                }}
-                                                style={{
-                                                    flex: 1,
-                                                    background: 'rgba(255, 0, 0, 0.15)',
-                                                    border: '1px solid rgba(255, 0, 0, 0.4)',
-                                                    color: '#ff6666',
-                                                    padding: '4px 8px',
-                                                    borderRadius: '4px',
-                                                    cursor: 'pointer',
-                                                    fontSize: '9px',
-                                                }}
-                                            >
-                                                ✗ Bad
-                                            </button>
-                                        </div>
-                                        <div style={{ fontSize: '9px', color: '#555', fontStyle: 'italic' }}>
-                                            Step {currentStep + 1} of {nodePath.length}
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        )}
-                    </div>
-                )}
-            </div>
+        <>
+            {/* Lighting */}
+            <ambientLight intensity={0.3} />
+            <directionalLight position={[4, 7, 3]} intensity={0.8} castShadow />
+            <directionalLight position={[-4, 3, -2]} intensity={0.4} color="#6699cc" />
             
-            {/* Controls */}
-            <div
-                style={{
-                    position: 'absolute',
-                    top: '20px',
-                    right: '20px',
-                    background: 'rgba(20, 20, 20, 0.9)',
-                    padding: '12px',
-                    borderRadius: '12px',
-                    border: '1px solid rgba(255, 255, 255, 0.1)',
-                    backdropFilter: 'blur(10px)',
-                    zIndex: 10,
-                    maxWidth: '180px',
-                    width: '180px',
-                }}
-            >
+            {/* 2D connection lines */}
+            {twoDLines.map((line, idx) => (
+                <Line
+                    key={`2d-${idx}`}
+                    points={[line.from, line.to]}
+                    color="#333344"
+                    lineWidth={1}
+                    transparent
+                    opacity={0.4}
+                />
+            ))}
+            
+            {/* Hierarchical connection lines */}
+            {hierarchicalLines.map((line, idx) => (
+                <Line
+                    key={`3d-${idx}`}
+                    points={[line.from, line.to]}
+                    color="#4444aa"
+                    lineWidth={1.5}
+                    transparent
+                    opacity={0.6}
+                />
+            ))}
+            
+            {/* Nodes */}
+            {nodes.map(node => {
+                const pos = nodePositions.get(node.id);
+                if (!pos) return null;
+                
+                const exploration = explorationData.get(node.id) || {
+                    visits: 0,
+                    insightful: 0,
+                    neutral: 0,
+                    familiar: 0
+                };
+                
+                const layerChange = changedLayerNodes.get(node.id);
+                
+                return (
+                    <NodeMarker
+                        key={node.id}
+                        id={node.id}
+                        label={node.label}
+                        position={pos}
+                        color={getNodeColor(node.id)}
+                        onClick={onNodeClick}
+                        isActive={activeNode === node.id || isNodeInPath(node.id)}
+                        is2DMode={!activeNode}
+                        exploration={exploration}
+                        cyberneticMode={cyberneticMode}
+                        layerChanged={!!layerChange}
+                    />
+                );
+            })}
+            
+            <CameraController
+                targetPosition={cameraSettings.position}
+                targetLookAt={cameraSettings.lookAt}
+                is2DMode={cameraSettings.is2DMode}
+            />
+        </>
+    );
+};
+
+// ==== Feedback Panel ====
+interface FeedbackPanelProps {
+    nodeId: string;
+    nodeLabel: string;
+    onFeedback: (nodeId: string, type: 'insightful' | 'neutral' | 'familiar') => void;
+    onClose: () => void;
+}
+
+const FeedbackPanel: React.FC<FeedbackPanelProps> = ({ nodeId, nodeLabel, onFeedback, onClose }) => {
+    return (
+        <div
+            style={{
+                position: 'absolute',
+                bottom: 20,
+                left: '50%',
+                transform: 'translateX(-50%)',
+                background: 'rgba(10,10,15,0.95)',
+                borderRadius: 12,
+                border: '1px solid rgba(255,255,255,0.1)',
+                padding: '16px 20px',
+                color: '#ffffff',
+                zIndex: 3,
+                minWidth: 400,
+            }}
+        >
+            <div style={{ fontSize: 14, marginBottom: 12, textAlign: 'center' }}>
+                How valuable was exploring <strong>{nodeLabel}</strong>?
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
                 <button
-                    onClick={resetSimulation}
+                    onClick={() => {
+                        onFeedback(nodeId, 'insightful');
+                        onClose();
+                    }}
                     style={{
-                        background: 'rgba(0, 212, 255, 0.2)',
-                        border: '1px solid rgba(0, 212, 255, 0.5)',
-                        color: '#00d4ff',
-                        padding: '6px 12px',
-                        borderRadius: '6px',
+                        background: 'rgba(78, 205, 196, 0.2)',
+                        border: '1px solid rgba(78, 205, 196, 0.5)',
+                        color: '#4ECDC4',
+                        borderRadius: 8,
+                        padding: '10px 20px',
                         cursor: 'pointer',
-                        fontSize: '10px',
-                        marginBottom: '6px',
-                        width: '100%',
-                        transition: 'all 0.3s',
-                    }}
-                    onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                    }}
-                    onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
+                        fontSize: 13,
+                        fontWeight: 500,
                     }}
                 >
-                    Reset System
-                </button>
-                <button
-                    onClick={() => setAnimationRunning(!animationRunning)}
-                    style={{
-                        background: 'rgba(0, 212, 255, 0.2)',
-                        border: '1px solid rgba(0, 212, 255, 0.5)',
-                        color: '#00d4ff',
-                        padding: '6px 12px',
-                        borderRadius: '6px',
-                        cursor: 'pointer',
-                        fontSize: '10px',
-                        marginBottom: '6px',
-                        width: '100%',
-                        transition: 'all 0.3s',
-                    }}
-                    onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                    }}
-                    onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
-                    }}
-                >
-                    {animationRunning ? 'Pause' : 'Resume'} Animation
-                </button>
-                <button
-                    onClick={randomPulse}
-                    style={{
-                        background: 'rgba(0, 212, 255, 0.2)',
-                        border: '1px solid rgba(0, 212, 255, 0.5)',
-                        color: '#00d4ff',
-                        padding: '6px 12px',
-                        borderRadius: '6px',
-                        cursor: 'pointer',
-                        fontSize: '10px',
-                        marginBottom: '6px',
-                        width: '100%',
-                        transition: 'all 0.3s',
-                    }}
-                    onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                    }}
-                    onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
-                    }}
-                >
-                    Random Input
-                </button>
-                <button
-                    onClick={toggleRandomize}
-                    style={{
-                        background: isRandomized ? 'rgba(255, 107, 107, 0.2)' : 'rgba(0, 212, 255, 0.2)',
-                        border: isRandomized ? '1px solid rgba(255, 107, 107, 0.5)' : '1px solid rgba(0, 212, 255, 0.5)',
-                        color: isRandomized ? '#FF6B6B' : '#00d4ff',
-                        padding: '6px 12px',
-                        borderRadius: '6px',
-                        cursor: 'pointer',
-                        fontSize: '10px',
-                        width: '100%',
-                        transition: 'all 0.3s',
-                    }}
-                    onMouseEnter={(e) => {
-                        if (isRandomized) {
-                            e.currentTarget.style.background = 'rgba(255, 107, 107, 0.3)';
-                        } else {
-                            e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                        }
-                    }}
-                    onMouseLeave={(e) => {
-                        if (isRandomized) {
-                            e.currentTarget.style.background = 'rgba(255, 107, 107, 0.2)';
-                        } else {
-                            e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
-                        }
-                    }}
-                >
-                    {isRandomized ? 'Restore Original' : 'Randomize Connections'}
+                    🔍 Insightful
+                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>New perspective</div>
                 </button>
                 <button
                     onClick={() => {
-                        setAdaptiveMode(!adaptiveMode);
-                        if (!adaptiveMode) {
-                            // Initialize all node weights to 1.0 when entering adaptive mode
-                            const initialWeights = new Map<string, number>();
-                            processedNodes.forEach(node => initialWeights.set(node.id, 1.0));
-                            setNodeWeights(initialWeights);
-                        }
+                        onFeedback(nodeId, 'neutral');
+                        onClose();
                     }}
                     style={{
-                        background: adaptiveMode ? 'rgba(147, 51, 234, 0.2)' : 'rgba(0, 212, 255, 0.2)',
-                        border: adaptiveMode ? '1px solid rgba(147, 51, 234, 0.5)' : '1px solid rgba(0, 212, 255, 0.5)',
-                        color: adaptiveMode ? '#a78bfa' : '#00d4ff',
-                        padding: '6px 12px',
-                        borderRadius: '6px',
+                        background: 'rgba(255,255,255,0.1)',
+                        border: '1px solid rgba(255,255,255,0.2)',
+                        color: '#ffffff',
+                        borderRadius: 8,
+                        padding: '10px 20px',
                         cursor: 'pointer',
-                        fontSize: '10px',
-                        width: '100%',
-                        transition: 'all 0.3s',
-                    }}
-                    onMouseEnter={(e) => {
-                        if (adaptiveMode) {
-                            e.currentTarget.style.background = 'rgba(147, 51, 234, 0.3)';
-                        } else {
-                            e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                        }
-                    }}
-                    onMouseLeave={(e) => {
-                        if (adaptiveMode) {
-                            e.currentTarget.style.background = 'rgba(147, 51, 234, 0.2)';
-                        } else {
-                            e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
-                        }
+                        fontSize: 13,
+                        fontWeight: 500,
                     }}
                 >
-                    {adaptiveMode ? '🔄 Cybernetic Mode ON' : 'Cybernetic Mode'}
+                    ➖ Neutral
+                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>Familiar info</div>
                 </button>
-            </div>
-            
-            {/* Zoom Controls */}
-            <div
-                style={{
-                    position: 'absolute',
-                    bottom: '220px',
-                    right: '20px',
-                    background: 'rgba(20, 20, 20, 0.9)',
-                    padding: '10px',
-                    borderRadius: '12px',
-                    border: '1px solid rgba(255, 255, 255, 0.1)',
-                    backdropFilter: 'blur(10px)',
-                    zIndex: 10,
-                    width: '180px',
-                    display: 'flex',
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    gap: '10px',
-                }}
-            >
                 <button
-                    onClick={handleZoomOut}
+                    onClick={() => {
+                        onFeedback(nodeId, 'familiar');
+                        onClose();
+                    }}
                     style={{
-                        background: 'rgba(0, 212, 255, 0.2)',
-                        border: '1px solid rgba(0, 212, 255, 0.5)',
-                        color: '#00d4ff',
-                        padding: '8px',
-                        borderRadius: '6px',
+                        background: 'rgba(243, 129, 129, 0.2)',
+                        border: '1px solid rgba(243, 129, 129, 0.5)',
+                        color: '#F38181',
+                        borderRadius: 8,
+                        padding: '10px 20px',
                         cursor: 'pointer',
-                        fontSize: '16px',
-                        fontWeight: 'bold',
-                        width: '36px',
-                        height: '36px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        transition: 'all 0.3s',
-                        flexShrink: 0,
-                    }}
-                    onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                    }}
-                    onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
+                        fontSize: 13,
+                        fontWeight: 500,
                     }}
                 >
-                    −
-                </button>
-                <div style={{ fontSize: '11px', color: '#00d4ff', textAlign: 'center', flex: 1, fontWeight: '600' }}>
-                    {Math.round(zoomLevel * 100)}%
-                </div>
-                <button
-                    onClick={handleZoomIn}
-                    style={{
-                        background: 'rgba(0, 212, 255, 0.2)',
-                        border: '1px solid rgba(0, 212, 255, 0.5)',
-                        color: '#00d4ff',
-                        padding: '8px',
-                        borderRadius: '6px',
-                        cursor: 'pointer',
-                        fontSize: '16px',
-                        fontWeight: 'bold',
-                        width: '36px',
-                        height: '36px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        transition: 'all 0.3s',
-                        flexShrink: 0,
-                    }}
-                    onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.3)';
-                    }}
-                    onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.2)';
-                    }}
-                >
-                    +
+                    🔁 Too Familiar
+                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>Already known</div>
                 </button>
             </div>
-            
-            {/* Legend */}
-            <div
-                style={{
-                    position: 'absolute',
-                    bottom: '20px',
-                    right: '20px',
-                    background: 'rgba(20, 20, 20, 0.9)',
-                    padding: '15px',
-                    borderRadius: '12px',
-                    border: '1px solid rgba(255, 255, 255, 0.1)',
-                    backdropFilter: 'blur(10px)',
-                    zIndex: 10,
-                    width: '180px',
-                }}
-            >
-                <h3 style={{ fontSize: '12px', marginBottom: '10px', color: '#fff' }}>
-                    Main Categories
-                </h3>
-                {legendItems.map((item, index) => (
-                    <div
-                        key={index}
-                        style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            marginBottom: '8px',
-                            fontSize: '11px',
-                            color: '#fff',
-                        }}
-                    >
-                        <div
-                            style={{
-                                width: '12px',
-                                height: '12px',
-                                borderRadius: '50%',
-                                background: item.color,
-                                marginRight: '8px',
-                            }}
-                        />
-                        <span>{item.label}</span>
-                    </div>
-                ))}
-            </div>
-            
-            {/* SVG */}
-            <svg ref={svgRef} style={{ width: '100%', height: '100%' }} />
-            
-            {/* Styles */}
-            <style>{`
-        .arrow {
-          fill: rgba(255, 255, 255, 0.3);
-        }
-        .arrow.active {
-          fill: rgba(0, 212, 255, 0.8);
-        }
-        .node:hover circle {
-          filter: brightness(1.3);
-        }
-      `}</style>
         </div>
     );
 };
 
-export default CyberneticDesignNetwork;
+// ==== Exploration Stats Panel ====
+interface ExplorationStatsPanelProps {
+    explorationData: Map<string, NodeExploration>;
+    nodes: RawNode[];
+}
+
+const ExplorationStatsPanel: React.FC<ExplorationStatsPanelProps> = ({ explorationData, nodes }) => {
+    const stats = useMemo(() => {
+        let totalExplored = 0;
+        let totalInsightful = 0;
+        let totalNeutral = 0;
+        let totalFamiliar = 0;
+        
+        explorationData.forEach(data => {
+            if (data.visits > 0) totalExplored++;
+            totalInsightful += data.insightful;
+            totalNeutral += data.neutral;
+            totalFamiliar += data.familiar;
+        });
+        
+        const explorationRate = (totalExplored / nodes.length) * 100;
+        const underExplored = nodes.length - totalExplored;
+        
+        return {
+            explorationRate: explorationRate.toFixed(0),
+            underExplored,
+            totalInsightful,
+            totalNeutral,
+            totalFamiliar
+        };
+    }, [explorationData, nodes]);
+    
+    return (
+        <div
+            style={{
+                position: 'absolute',
+                bottom: 20,
+                right: 20,
+                background: 'rgba(10,10,15,0.9)',
+                borderRadius: 12,
+                border: '1px solid rgba(170, 150, 218, 0.3)',
+                padding: '16px',
+                color: '#ffffff',
+                zIndex: 2,
+                minWidth: 220,
+            }}
+        >
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10, color: '#AA96DA' }}>
+                Exploration Stats
+            </div>
+            <div style={{ fontSize: 12, color: '#cccccc', lineHeight: 1.8 }}>
+                <div>Network Coverage: <strong>{stats.explorationRate}%</strong></div>
+                <div>Under-explored: <strong>{stats.underExplored}</strong> nodes</div>
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.1)' }}>
+                    <div>🔍 Insightful: {stats.totalInsightful}</div>
+                    <div>➖ Neutral: {stats.totalNeutral}</div>
+                    <div>🔁 Familiar: {stats.totalFamiliar}</div>
+                </div>
+            </div>
+            <div style={{
+                marginTop: 12,
+                paddingTop: 12,
+                borderTop: '1px solid rgba(255,255,255,0.1)',
+                fontSize: 10,
+                color: '#888888',
+                fontStyle: 'italic'
+            }}>
+                Nodes with ↕️ changed layers based on feedback
+            </div>
+        </div>
+    );
+};
+
+// ==== Left Panel Component ====
+interface LeftPanelProps {
+    activeNode: string | null;
+    layers: NodeLayer[];
+    previousLayers: NodeLayer[];
+    nodes: RawNode[];
+    getNodeColor: (id: string) => string;
+    onClose: () => void;
+    cyberneticMode: boolean;
+}
+
+const LeftPanel: React.FC<LeftPanelProps> = ({
+                                                 activeNode,
+                                                 layers,
+                                                 previousLayers,
+                                                 nodes,
+                                                 getNodeColor,
+                                                 onClose,
+                                                 cyberneticMode
+                                             }) => {
+    if (!activeNode || layers.length === 0) return null;
+    
+    const getNodeLabel = (id: string) => {
+        return nodes.find(n => n.id === id)?.label || id;
+    };
+    
+    // Get previous layer for each node
+    const previousLayerMap = useMemo(() => {
+        const map = new Map<string, number>();
+        previousLayers.forEach(layer => {
+            layer.nodes.forEach(nodeId => {
+                map.set(nodeId, layer.level);
+            });
+        });
+        return map;
+    }, [previousLayers]);
+    
+    // Count layer changes
+    const layerChanges = useMemo(() => {
+        let promoted = 0;
+        let demoted = 0;
+        
+        layers.forEach(layer => {
+            layer.nodes.forEach(nodeId => {
+                const prevLevel = previousLayerMap.get(nodeId);
+                if (prevLevel !== undefined && prevLevel !== layer.level) {
+                    if (layer.level < prevLevel) promoted++;
+                    else demoted++;
+                }
+            });
+        });
+        
+        return { promoted, demoted };
+    }, [layers, previousLayerMap]);
+    
+    return (
+        <div
+            style={{
+                position: 'absolute',
+                top: 20,
+                left: 20,
+                width: 320,
+                maxHeight: 'calc(100vh - 40px)',
+                background: 'rgba(10,10,15,0.95)',
+                borderRadius: 12,
+                border: '1px solid rgba(255,255,255,0.1)',
+                padding: '20px',
+                color: '#ffffff',
+                overflow: 'auto',
+                zIndex: 2,
+            }}
+        >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', marginBottom: 16 }}>
+                <div>
+                    <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 4 }}>
+                        {getNodeLabel(activeNode)}
+                    </div>
+                    <div style={{ fontSize: 12, color: '#aaaaaa' }}>
+                        Hierarchical Network Path
+                    </div>
+                </div>
+                <button
+                    onClick={onClose}
+                    style={{
+                        background: 'rgba(255,255,255,0.1)',
+                        border: '1px solid rgba(255,255,255,0.2)',
+                        color: '#ffffff',
+                        borderRadius: 6,
+                        padding: '6px 12px',
+                        cursor: 'pointer',
+                        fontSize: 12,
+                    }}
+                >
+                    Close
+                </button>
+            </div>
+            
+            {cyberneticMode && (layerChanges.promoted > 0 || layerChanges.demoted > 0) && previousLayers.length > 0 && (
+                <div style={{
+                    background: 'rgba(255, 170, 0, 0.1)',
+                    border: '1px solid rgba(255, 170, 0, 0.3)',
+                    borderRadius: 8,
+                    padding: '10px 12px',
+                    marginBottom: 16,
+                    fontSize: 12,
+                    color: '#ffaa00'
+                }}>
+                    ↕️ Layers reorganized!
+                    <div style={{ marginTop: 4, fontSize: 11, opacity: 0.8 }}>
+                        ↑ {layerChanges.promoted} promoted • ↓ {layerChanges.demoted} demoted
+                    </div>
+                </div>
+            )}
+            
+            <div style={{
+                fontSize: 13,
+                color: '#cccccc',
+                lineHeight: 1.5,
+                marginBottom: 20,
+                paddingBottom: 20,
+                borderBottom: '1px solid rgba(255,255,255,0.1)'
+            }}>
+                {cyberneticMode ? (
+                    <>
+                        Layers are <strong>reordered</strong> by feedback: <strong>insightful</strong> nodes promoted to earlier layers, <strong>familiar</strong> nodes demoted to later layers.
+                    </>
+                ) : (
+                    <>
+                        This view shows the hierarchical connections from the selected node.
+                        Each layer represents nodes at increasing distances from the source.
+                    </>
+                )}
+            </div>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {layers.map((layer, idx) => (
+                    <div key={idx}>
+                        <div style={{
+                            fontSize: 11,
+                            fontWeight: 600,
+                            color: '#888888',
+                            textTransform: 'uppercase',
+                            letterSpacing: 1,
+                            marginBottom: 8
+                        }}>
+                            {idx === 0 ? 'Source' : `Layer ${idx}`}
+                        </div>
+                        <div style={{
+                            display: 'flex',
+                            flexWrap: 'wrap',
+                            gap: 8
+                        }}>
+                            {layer.nodes.map(nodeId => {
+                                const color = getNodeColor(nodeId);
+                                const prevLevel = previousLayerMap.get(nodeId);
+                                const levelChanged = prevLevel !== undefined && prevLevel !== layer.level;
+                                const wasPromoted = prevLevel !== undefined && layer.level < prevLevel;
+                                const wasDemoted = prevLevel !== undefined && layer.level > prevLevel;
+                                
+                                return (
+                                    <div
+                                        key={nodeId}
+                                        style={{
+                                            padding: '6px 12px',
+                                            borderRadius: 20,
+                                            fontSize: 12,
+                                            background: levelChanged ? 'rgba(255, 170, 0, 0.15)' : `${color}22`,
+                                            border: levelChanged ? '1px solid #ffaa00' : `1px solid ${color}`,
+                                            color: '#ffffff',
+                                            boxShadow: levelChanged ? '0 0 12px rgba(255, 170, 0, 0.4)' : `0 0 8px ${color}44`,
+                                        }}
+                                    >
+                                        {getNodeLabel(nodeId)}
+                                        {wasPromoted && <span style={{ marginLeft: 4 }}>↑</span>}
+                                        {wasDemoted && <span style={{ marginLeft: 4 }}>↓</span>}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+};
+
+// ==== Main Wrapper Component ====
+const CyberneticTopoMap: React.FC = () => {
+    const nodes = data.nodes as RawNode[];
+    const links = data.links as RawLink[];
+    const [activeNode, setActiveNode] = useState<string | null>(null);
+    const [hierarchicalLayers, setHierarchicalLayers] = useState<NodeLayer[]>([]);
+    const [previousLayers, setPreviousLayers] = useState<NodeLayer[]>([]);
+    const [cyberneticMode, setCyberneticMode] = useState(false);
+    const [layout2D, setLayout2D] = useState<Map<string, { x: number; y: number; vx: number; vy: number }>>(
+        () => forceDirectedLayout(nodes, links, false)
+    );
+    const [explorationData, setExplorationData] = useState<Map<string, NodeExploration>>(() => {
+        const map = new Map<string, NodeExploration>();
+        nodes.forEach(node => {
+            map.set(node.id, { visits: 0, insightful: 0, neutral: 0, familiar: 0 });
+        });
+        return map;
+    });
+    const [showFeedback, setShowFeedback] = useState(false);
+    const [feedbackNodeId, setFeedbackNodeId] = useState<string | null>(null);
+    
+    const getNodeColor = useCallback((id: string): string => {
+        const main: Record<string, string> = {
+            form: '#4ECDC4',
+            function: '#95E1D3',
+            material: '#FF6B6B',
+            emotion: '#F38181',
+            process: '#AA96DA',
+            feedbackLoop: '#FCBAD3',
+        };
+        return main[id] || '#a0a0a0';
+    }, []);
+    
+    const handleNodeClick = (id: string) => {
+        if (activeNode === id) {
+            // Show feedback before closing
+            if (cyberneticMode) {
+                setFeedbackNodeId(id);
+                setShowFeedback(true);
+            }
+            setActiveNode(null);
+            setHierarchicalLayers([]);
+            setPreviousLayers([]);
+        } else {
+            // Save previous layers before updating
+            if (hierarchicalLayers.length > 0 && cyberneticMode) {
+                setPreviousLayers(hierarchicalLayers);
+            }
+            
+            setActiveNode(id);
+            const newLayers = getAdaptiveHierarchicalLayers(id, links, explorationData, cyberneticMode);
+            setHierarchicalLayers(newLayers);
+            
+            // Track visit
+            setExplorationData(prev => {
+                const newMap = new Map(prev);
+                const current = newMap.get(id)!;
+                newMap.set(id, { ...current, visits: current.visits + 1 });
+                return newMap;
+            });
+            
+            // Show feedback after a moment
+            if (cyberneticMode) {
+                setTimeout(() => {
+                    setFeedbackNodeId(id);
+                    setShowFeedback(true);
+                }, 1500);
+            }
+        }
+    };
+    
+    const handleFeedback = (nodeId: string, type: 'insightful' | 'neutral' | 'familiar') => {
+        // Update exploration data
+        const newExplorationData = new Map(explorationData);
+        const current = newExplorationData.get(nodeId)!;
+        newExplorationData.set(nodeId, {
+            ...current,
+            [type]: current[type] + 1
+        });
+        setExplorationData(newExplorationData);
+        
+        // Regenerate path with updated feedback
+        if (activeNode && cyberneticMode) {
+            setPreviousLayers(hierarchicalLayers);
+            const newLayers = getAdaptiveHierarchicalLayers(activeNode, links, newExplorationData, cyberneticMode);
+            setHierarchicalLayers(newLayers);
+        }
+    };
+    
+    const handleClose = () => {
+        setActiveNode(null);
+        setHierarchicalLayers([]);
+        setPreviousLayers([]);
+    };
+    
+    const handleRandomize = () => {
+        if (!activeNode) {
+            setLayout2D(forceDirectedLayout(nodes, links, true));
+        }
+    };
+    
+    const toggleCyberneticMode = () => {
+        setCyberneticMode(!cyberneticMode);
+        // Regenerate current path if one is active
+        if (activeNode) {
+            setPreviousLayers(hierarchicalLayers);
+            const newLayers = getAdaptiveHierarchicalLayers(activeNode, links, explorationData, !cyberneticMode);
+            setHierarchicalLayers(newLayers);
+        }
+    };
+    
+    const getNodeLabel = (id: string) => {
+        return nodes.find(n => n.id === id)?.label || id;
+    };
+    
+    return (
+        <div
+            style={{
+                width: '100vw',
+                height: '100vh',
+                background: cyberneticMode
+                    ? 'radial-gradient(circle at top, #1a0a2e 0, #050509 60%)'
+                    : 'radial-gradient(circle at top, #151822 0, #050509 60%)',
+                position: 'relative',
+                color: '#ffffff',
+                overflow: 'hidden',
+            }}
+        >
+            {/* Control buttons */}
+            {!activeNode && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: 20,
+                        right: 20,
+                        display: 'flex',
+                        gap: 10,
+                        zIndex: 2,
+                    }}
+                >
+                    <button
+                        onClick={handleRandomize}
+                        style={{
+                            background: 'rgba(255,255,255,0.1)',
+                            border: '1px solid rgba(255,255,255,0.2)',
+                            color: '#ffffff',
+                            borderRadius: 8,
+                            padding: '10px 16px',
+                            cursor: 'pointer',
+                            fontSize: 13,
+                            fontWeight: 500,
+                        }}
+                    >
+                        Randomize
+                    </button>
+                    <button
+                        onClick={toggleCyberneticMode}
+                        style={{
+                            background: cyberneticMode
+                                ? 'rgba(170, 150, 218, 0.3)'
+                                : 'rgba(255,255,255,0.1)',
+                            border: cyberneticMode
+                                ? '1px solid rgba(170, 150, 218, 0.6)'
+                                : '1px solid rgba(255,255,255,0.2)',
+                            color: '#ffffff',
+                            borderRadius: 8,
+                            padding: '10px 16px',
+                            cursor: 'pointer',
+                            fontSize: 13,
+                            fontWeight: 500,
+                            boxShadow: cyberneticMode ? '0 0 12px rgba(170, 150, 218, 0.5)' : 'none',
+                        }}
+                    >
+                        {cyberneticMode ? 'Cybernetic: ON' : 'Cybernetic: OFF'}
+                    </button>
+                </div>
+            )}
+            
+            {/* Overview Description */}
+            {!activeNode && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: 20,
+                        left: 20,
+                        padding: '14px 18px',
+                        background: 'rgba(10,10,15,0.9)',
+                        borderRadius: 12,
+                        border: '1px solid rgba(255,255,255,0.08)',
+                        maxWidth: 340,
+                        fontSize: 12,
+                        lineHeight: 1.6,
+                        zIndex: 2,
+                    }}
+                >
+                    <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>
+                        Design Discovery Map
+                    </div>
+                    <div style={{ color: '#aaaaaa' }}>
+                        {cyberneticMode ? (
+                            <>
+                                Cybernetic mode <strong>reorganizes layers</strong> based on feedback: insightful nodes ↑ to earlier layers, familiar nodes ↓ to later layers. Visual opacity changes reflect your exploration patterns.
+                            </>
+                        ) : (
+                            <>
+                                A living, self-regulating design system where each decision creates feedback loops throughout the map.
+                            </>
+                        )}
+                    </div>
+                    <div style={{ marginTop: 12, color: '#888888', fontSize: 11 }}>
+                        Click any node to explore • Scroll to zoom
+                        {cyberneticMode && ' • Your feedback reshapes the hierarchy'}
+                    </div>
+                </div>
+            )}
+            
+            {/* Exploration Stats Panel */}
+            {cyberneticMode && !activeNode && (
+                <ExplorationStatsPanel explorationData={explorationData} nodes={nodes} />
+            )}
+            
+            {/* Feedback Panel */}
+            {showFeedback && feedbackNodeId && (
+                <FeedbackPanel
+                    nodeId={feedbackNodeId}
+                    nodeLabel={getNodeLabel(feedbackNodeId)}
+                    onFeedback={handleFeedback}
+                    onClose={() => setShowFeedback(false)}
+                />
+            )}
+            
+            {/* Left Panel */}
+            <LeftPanel
+                activeNode={activeNode}
+                layers={hierarchicalLayers}
+                previousLayers={previousLayers}
+                nodes={nodes}
+                getNodeColor={getNodeColor}
+                onClose={handleClose}
+                cyberneticMode={cyberneticMode}
+            />
+            
+            <Canvas shadows camera={{ position: [0, 16, 0.1], fov: 45 }}>
+                <CyberneticTopoScene
+                    activeNode={activeNode}
+                    hierarchicalLayers={hierarchicalLayers}
+                    onNodeClick={handleNodeClick}
+                    cyberneticMode={cyberneticMode}
+                    layout2D={layout2D}
+                    explorationData={explorationData}
+                    previousLayers={previousLayers}
+                />
+            </Canvas>
+        </div>
+    );
+};
+
+export default CyberneticTopoMap;
